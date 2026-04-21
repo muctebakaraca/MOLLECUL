@@ -7,6 +7,7 @@ from streamlit_folium import st_folium
 import folium
 import streamlit.components.v1 as components
 import joblib
+import xgboost as xgb
 
 st.set_page_config(
     page_title="Mollecul | AI Real Estate Intelligence",
@@ -69,6 +70,112 @@ MODEL_CAT_COLS = [
 ]
 MODEL_ALL_COLS = MODEL_NUM_COLS + MODEL_CAT_COLS
 
+FEATURE_LABELS = {
+    "lat": "Latitude",
+    "lng": "Longitude",
+    "yearBuilt": "Year Built",
+    "yearBuiltEffective": "Effective Year Built",
+    "sqft": "Living Area",
+    "livingArea": "Interior Area",
+    "grossSqft": "Gross Area",
+    "groundFloorSqft": "Ground Floor Area",
+    "lotSqft": "Lot Size",
+    "lotAcres": "Lot Acres",
+    "beds": "Bedrooms",
+    "bathsFull": "Full Baths",
+    "bathsHalf": "Half Baths",
+    "bathsTotal": "Bathrooms",
+    "totalRooms": "Total Rooms",
+    "stories": "Stories",
+    "garageSize": "Garage Size",
+    "garageSpaces": "Garage Spaces",
+    "basementSqft": "Basement Area",
+    "fireplaces": "Fireplaces",
+    "assessedTotal": "Assessed Total",
+    "assessedLand": "Assessed Land",
+    "assessedImprov": "Assessed Improvements",
+    "assessedPerSqft": "Assessed $/Sq Ft",
+    "assessedImprPerSqft": "Assessed Improv $/Sq Ft",
+    "marketTotal": "Market Total",
+    "marketLand": "Market Land",
+    "marketImprov": "Market Improvements",
+    "taxAmount": "Tax Amount",
+    "taxYear": "Tax Year",
+    "taxPerSqft": "Tax $/Sq Ft",
+    "calcTotalValue": "Calculated Total Value",
+    "calcLandValue": "Calculated Land Value",
+    "calcImprValue": "Calculated Improvement Value",
+    "calcValuePerSqft": "Calculated $/Sq Ft",
+    "salePrice": "Sale Price",
+    "pricePerSqft": "Price Per Sq Ft",
+    "pricePerBed": "Price Per Bed",
+    "disclosed": "Sale Disclosure",
+    "saleYear": "Sale Year",
+    "zip": "ZIP Code",
+    "city": "City",
+    "county": "County",
+    "municipality": "Municipality",
+    "subdivision": "Subdivision",
+    "taxCodeArea": "Tax Code Area",
+    "geoIdV4_N2": "Neighborhood ID",
+    "geoIdV4_N4": "Sub-Neighborhood ID",
+    "geoIdV4_DB": "District Boundary",
+    "geoIdV4_SB": "Sub-Boundary",
+    "propertyType": "Property Type",
+    "propSubtype": "Property Subtype",
+    "propClass": "Property Class",
+    "propLandUse": "Land Use",
+    "ownerOccupied": "Occupancy",
+    "pool": "Pool",
+    "basement": "Basement",
+    "bldgType": "Building Type",
+    "condition": "Condition",
+    "view": "View",
+    "floors": "Floor Finish",
+    "garageType": "Garage Type",
+    "heatingType": "Heating",
+    "coolingType": "Cooling",
+    "constructionType": "Construction",
+    "foundationType": "Foundation",
+    "roofMaterial": "Roof Material",
+    "roofType": "Roof Shape",
+    "wallType": "Wall Type",
+    "frameType": "Frame Type",
+    "saleType": "Sale Type",
+    "saleDocType": "Sale Document",
+    "cashOrMortgage": "Cash or Mortgage",
+    "newConstruction": "New Construction",
+    "interFamily": "Inter-Family Transfer",
+    "sellerCarryback": "Seller Carryback",
+}
+
+MODEL_SOURCE_ALIASES = {
+    "lat": ["LATITUDE"],
+    "lng": ["LONGITUDE"],
+    "yearBuilt": ["YEAR BUILT"],
+    "sqft": ["SQUARE FEET"],
+    "lotSqft": ["LOT SIZE"],
+    "beds": ["BEDS"],
+    "bathsTotal": ["BATHS"],
+    "salePrice": ["PRICE"],
+    "pricePerSqft": ["PRICE_PER_SQFT_FINAL", "$/SQUARE FEET"],
+    "zip": ["ZIP", "ZIP OR POSTAL CODE"],
+    "city": ["CITY"],
+    "propertyType": ["PROPERTY TYPE"],
+    "saleType": ["SALE TYPE"],
+}
+
+CURRENCY_FEATURES = {
+    "assessedTotal", "assessedLand", "assessedImprov", "assessedPerSqft",
+    "assessedImprPerSqft", "marketTotal", "marketLand", "marketImprov",
+    "taxAmount", "taxPerSqft", "calcTotalValue", "calcLandValue",
+    "calcImprValue", "calcValuePerSqft", "salePrice", "pricePerSqft",
+    "pricePerBed",
+}
+AREA_FEATURES = {"sqft", "livingArea", "grossSqft", "groundFloorSqft", "lotSqft", "basementSqft", "garageSize"}
+COUNT_FEATURES = {"beds", "bathsFull", "bathsHalf", "bathsTotal", "totalRooms", "stories", "garageSpaces", "fireplaces"}
+YEAR_FEATURES = {"yearBuilt", "yearBuiltEffective", "taxYear", "saleYear"}
+
 @st.cache_resource
 def load_valuation_model():
     """Load the XGBoost valuation pipeline from disk."""
@@ -79,6 +186,211 @@ def load_valuation_model():
     except Exception as e:
         st.warning(f"Could not load valuation model: {e}")
         return None
+
+
+def _is_missing_model_value(feature_name: str, value) -> bool:
+    if feature_name in MODEL_NUM_COLS:
+        return pd.isna(_to_float(value))
+    text = _to_text(value).lower()
+    return text in {"", "unknown", "__missing__"}
+
+
+def _get_source_value(source_data: dict, feature_name: str):
+    candidates = [feature_name] + MODEL_SOURCE_ALIASES.get(feature_name, [])
+    for candidate in candidates:
+        if candidate not in source_data:
+            continue
+        value = source_data.get(candidate)
+        if not _is_missing_model_value(feature_name, value):
+            return value
+    return np.nan if feature_name in MODEL_NUM_COLS else "unknown"
+
+
+def _extract_sale_year(source_data: dict) -> float:
+    raw_sale_year = _get_source_value(source_data, "saleYear")
+    if pd.notna(_to_float(raw_sale_year)):
+        return _to_float(raw_sale_year)
+
+    for candidate in ("saleDate", "SALE DATE", "saleTransDate", "saleRecDate"):
+        if candidate not in source_data:
+            continue
+        parsed = pd.to_datetime(source_data.get(candidate), errors="coerce")
+        if pd.notna(parsed):
+            return float(parsed.year)
+    return np.nan
+
+
+def _build_feature_frame_from_source(source_data: dict) -> pd.DataFrame:
+    row = {}
+
+    for col in MODEL_NUM_COLS:
+        if col == "saleYear":
+            row[col] = _extract_sale_year(source_data)
+            continue
+        row[col] = _to_float(_get_source_value(source_data, col))
+
+    for col in MODEL_CAT_COLS:
+        value = _get_source_value(source_data, col)
+        row[col] = _to_text(value) or "unknown"
+
+    return pd.DataFrame([row])[MODEL_ALL_COLS]
+
+
+def _format_feature_display_value(feature_name: str, value) -> str:
+    if _is_missing_model_value(feature_name, value):
+        return "Unknown"
+
+    if feature_name in CURRENCY_FEATURES:
+        return _format_currency(value)
+
+    if feature_name in AREA_FEATURES:
+        return f"{_format_metric_value(value)} sq ft"
+
+    if feature_name == "lotAcres":
+        return f"{_format_metric_value(value, decimals=2)} acres"
+
+    if feature_name in YEAR_FEATURES:
+        return _format_metric_value(value)
+
+    if feature_name in COUNT_FEATURES:
+        decimals = 1 if feature_name == "bathsTotal" else 0
+        return _format_metric_value(value, decimals=decimals)
+
+    if feature_name in {"lat", "lng"}:
+        return _format_metric_value(value, decimals=4)
+
+    return html.escape(_to_text(value))
+
+
+def _calculate_feature_impacts(property_record: dict) -> dict:
+    model = load_valuation_model()
+    source_data = property_record.get("MODEL_SOURCE")
+    if model is None or source_data is None:
+        return {"error": "AI valuation model is unavailable for feature-level impacts."}
+
+    try:
+        preprocessor = model.named_steps["preprocessor"]
+        estimator = model.named_steps["model"]
+        feature_df = _build_feature_frame_from_source(source_data)
+        transformed = preprocessor.transform(feature_df[MODEL_ALL_COLS])
+        transformed = np.asarray(transformed, dtype=np.float64)
+
+        feature_names = list(preprocessor.get_feature_names_out())
+        dmatrix = xgb.DMatrix(transformed, feature_names=feature_names)
+        contribs = estimator.get_booster().predict(dmatrix, pred_contribs=True)[0]
+
+        drivers = []
+        for encoded_name, impact in zip(feature_names, contribs[:-1]):
+            feature_name = encoded_name.split("__", 1)[1] if "__" in encoded_name else encoded_name
+            feature_value = feature_df.iloc[0][feature_name]
+            if _is_missing_model_value(feature_name, feature_value):
+                continue
+
+            drivers.append({
+                "feature": feature_name,
+                "label": FEATURE_LABELS.get(feature_name, feature_name),
+                "value": _format_feature_display_value(feature_name, feature_value),
+                "impact": float(impact),
+            })
+
+        drivers.sort(key=lambda item: abs(item["impact"]), reverse=True)
+        return {
+            "baseline": float(contribs[-1]),
+            "prediction": float(np.sum(contribs)),
+            "drivers": drivers,
+        }
+    except Exception as e:
+        return {"error": f"Could not compute feature impacts: {e}"}
+
+
+def _render_feature_impact_rows(drivers: list[dict]) -> str:
+    if not drivers:
+        return (
+            "<div style='font-size:11px;color:#8baec8;'>"
+            "No populated model features were available for this property."
+            "</div>"
+        )
+
+    max_impact = max(abs(driver["impact"]) for driver in drivers) or 1.0
+    rows = []
+
+    for driver in drivers:
+        impact = driver["impact"]
+        positive = impact >= 0
+        color = "#2ce4df" if positive else "#e7c65a"
+        width = max(12.0, (abs(impact) / max_impact) * 100)
+        impact_label = f"{'+' if positive else '-'}${abs(impact):,.0f}"
+
+        rows.append(f"""
+<div style="padding:10px 0;border-top:1px solid rgba(94,122,146,0.16);">
+  <div style="display:flex;align-items:flex-start;gap:10px;">
+    <div style="min-width:0;">
+      <div style="font-size:12px;font-weight:700;color:#ecf6ff;line-height:1.3;">{html.escape(driver['label'])}</div>
+      <div style="font-size:10px;color:#8baec8;margin-top:2px;line-height:1.4;">{driver['value']}</div>
+    </div>
+    <div style="margin-left:auto;font-family:'Sora',sans-serif;font-size:11px;font-weight:700;color:{color};white-space:nowrap;">{impact_label}</div>
+  </div>
+  <div style="margin-top:8px;height:7px;background:rgba(94,122,146,0.16);border-radius:999px;overflow:hidden;">
+    <div style="height:100%;width:{width:.1f}%;background:{color};box-shadow:0 0 12px {color}55;border-radius:999px;"></div>
+  </div>
+</div>
+""")
+
+    return "".join(rows)
+
+
+def _render_feature_impact_card(property_record: dict) -> str:
+    explanation = _calculate_feature_impacts(property_record)
+    if explanation.get("error"):
+        return f"""
+<div style="background:#0b1c30;border:1px solid rgba(231,198,90,0.18);border-radius:14px;padding:16px 18px;">
+  <div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.14em;color:#e7c65a;margin-bottom:6px;">Feature Impact</div>
+  <div style="font-size:11px;color:#8baec8;line-height:1.6;">{html.escape(explanation['error'])}</div>
+</div>
+"""
+
+    drivers = explanation["drivers"]
+    preview_drivers = drivers[:6]
+    remaining_drivers = drivers[6:]
+    baseline_value = _format_currency(explanation.get("baseline"))
+    prediction_value = _format_currency(explanation.get("prediction"))
+    preview_rows = _render_feature_impact_rows(preview_drivers)
+    detail_rows = _render_feature_impact_rows(remaining_drivers)
+    detail_html = ""
+
+    if remaining_drivers:
+        detail_html = f"""
+<details style="margin-top:12px;">
+  <summary style="cursor:pointer;font-size:11px;font-weight:700;color:#8baec8;list-style:none;">
+    View {len(remaining_drivers)} more observed feature effects
+  </summary>
+  <div style="margin-top:10px;">
+    {detail_rows}
+  </div>
+</details>
+"""
+
+    return f"""
+<div style="background:#0b1c30;border:1px solid rgba(94,166,255,0.22);border-radius:14px;padding:16px 18px;">
+  <div style="display:flex;align-items:flex-start;gap:12px;margin-bottom:8px;">
+    <div>
+      <div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.14em;color:#567592;">Feature Impact</div>
+      <div style="font-size:11px;color:#8baec8;margin-top:4px;line-height:1.5;">
+        How the model is moving this property away from its baseline value.
+      </div>
+    </div>
+    <div style="margin-left:auto;text-align:right;">
+      <div style="font-size:10px;color:#567592;text-transform:uppercase;letter-spacing:0.10em;">Baseline</div>
+      <div style="font-family:'Sora',sans-serif;font-size:13px;font-weight:700;color:#ecf6ff;">{baseline_value}</div>
+    </div>
+  </div>
+  <div style="font-size:10px;color:#567592;margin-bottom:8px;text-transform:uppercase;letter-spacing:0.10em;">Model Estimate</div>
+  <div style="font-family:'Sora',sans-serif;font-size:18px;font-weight:800;color:#5ea6ff;letter-spacing:-0.04em;margin-bottom:10px;">{prediction_value}</div>
+  <div style="font-size:10px;color:#567592;margin-bottom:2px;text-transform:uppercase;letter-spacing:0.10em;">Strongest Observed Drivers</div>
+  {preview_rows}
+  {detail_html}
+</div>
+"""
 
 def _predict_valuations(model, df_raw: pd.DataFrame) -> np.ndarray:
     """
@@ -337,6 +649,7 @@ def _build_attom_property_record(address: str, raw_property: dict, prediction: d
         "MODEL_ESTIMATE": ai_value,
         "ZIP": zip_code,
         "DATA_SOURCE": "ATTOM",
+        "MODEL_SOURCE": raw_property,
     }
 
 
@@ -367,6 +680,7 @@ def _build_market_property_record(row: pd.Series) -> dict:
         "MODEL_ESTIMATE": model_estimate,
         "ZIP": zip_code,
         "DATA_SOURCE": "DATASET",
+        "MODEL_SOURCE": row.to_dict(),
     }
 
 
@@ -524,6 +838,7 @@ def _render_property_panel(property_record: dict, prediction: dict | None = None
     price_label = html.escape(_to_text(property_record.get("PRICE_LABEL")) or "Price Reference")
     price_value = _format_currency(property_record.get("PRICE"))
     comparison_html = _render_value_comparison_chart(property_record)
+    feature_impact_html = _render_feature_impact_card(property_record)
 
     forecast_html = ""
     if prediction is not None:
@@ -588,6 +903,7 @@ def _render_property_panel(property_record: dict, prediction: dict | None = None
   </div>
   {forecast_html}
   {comparison_html}
+  {feature_impact_html}
   <div style="background:#0b1c30;border:1px solid rgba(44,228,223,0.10);border-radius:14px;padding:16px 18px;">
     <div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.14em;color:#567592;margin-bottom:4px;">{price_label}</div>
     <div style="font-family:'Sora',sans-serif;font-size:18px;font-weight:800;color:#ecf6ff;letter-spacing:-0.04em;">{price_value}</div>
