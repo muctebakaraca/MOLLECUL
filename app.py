@@ -391,6 +391,48 @@ def _extract_sale_year(source_data: dict) -> float:
     return np.nan
 
 
+def _clean_model_text_series(series: pd.Series) -> pd.Series:
+    cleaned = series.where(series.notna(), "").astype(str).str.strip()
+    missing_mask = cleaned.str.lower().isin({"", "none", "nan"})
+    return cleaned.mask(missing_mask, "")
+
+
+def _first_numeric_series(df_source: pd.DataFrame, feature_name: str) -> pd.Series:
+    result = pd.Series(np.nan, index=df_source.index, dtype="float64")
+    candidates = [feature_name] + MODEL_SOURCE_ALIASES.get(feature_name, [])
+    for candidate in candidates:
+        if candidate not in df_source.columns:
+            continue
+        candidate_series = pd.to_numeric(df_source[candidate], errors="coerce")
+        result = result.where(result.notna(), candidate_series)
+    return result
+
+
+def _extract_sale_year_series(df_source: pd.DataFrame) -> pd.Series:
+    sale_year = _first_numeric_series(df_source, "saleYear")
+    for candidate in ("saleDate", "SALE DATE", "saleTransDate", "saleRecDate"):
+        if candidate not in df_source.columns:
+            continue
+        parsed_year = pd.to_datetime(df_source[candidate], errors="coerce").dt.year.astype(float)
+        sale_year = sale_year.where(sale_year.notna(), parsed_year)
+        if sale_year.notna().all():
+            break
+    return sale_year
+
+
+def _first_text_series(df_source: pd.DataFrame, feature_name: str) -> pd.Series:
+    result = pd.Series("", index=df_source.index, dtype="object")
+    candidates = [feature_name] + MODEL_SOURCE_ALIASES.get(feature_name, [])
+    for candidate in candidates:
+        if candidate not in df_source.columns:
+            continue
+        candidate_series = _clean_model_text_series(df_source[candidate])
+        use_candidate = result.eq("") & candidate_series.ne("")
+        if use_candidate.any():
+            result = result.where(~use_candidate, candidate_series)
+    return result.where(result.ne(""), "unknown")
+
+
 def _build_feature_frame_from_source(source_data: dict) -> pd.DataFrame:
     row = {}
 
@@ -405,6 +447,21 @@ def _build_feature_frame_from_source(source_data: dict) -> pd.DataFrame:
         row[col] = _to_text(value) or "unknown"
 
     return pd.DataFrame([row])[MODEL_ALL_COLS]
+
+
+def _build_feature_frame_from_dataframe(df_source: pd.DataFrame) -> pd.DataFrame:
+    feat = pd.DataFrame(index=df_source.index)
+
+    for col in MODEL_NUM_COLS:
+        if col == "saleYear":
+            feat[col] = _extract_sale_year_series(df_source)
+            continue
+        feat[col] = _first_numeric_series(df_source, col)
+
+    for col in MODEL_CAT_COLS:
+        feat[col] = _first_text_series(df_source, col)
+
+    return feat[MODEL_ALL_COLS]
 
 
 def _format_feature_display_value(feature_name: str, value) -> str:
@@ -913,21 +970,10 @@ def _predict_valuations(model, df_raw: pd.DataFrame) -> np.ndarray:
     """
     Run the valuation model over the raw CSV dataframe.
     Returns an array of predicted sale prices (one per row).
-    Missing model columns are filled with 0 / 'unknown'.
+    Missing-value handling is kept consistent with the single-property
+    explainability path so the current estimate does not drift between panels.
     """
-    feat = pd.DataFrame(index=df_raw.index)
-
-    for col in MODEL_NUM_COLS:
-        if col in df_raw.columns:
-            feat[col] = pd.to_numeric(df_raw[col], errors="coerce").fillna(0)
-        else:
-            feat[col] = 0.0
-
-    for col in MODEL_CAT_COLS:
-        if col in df_raw.columns:
-            feat[col] = df_raw[col].astype(str).fillna("unknown")
-        else:
-            feat[col] = "unknown"
+    feat = _build_feature_frame_from_dataframe(df_raw)
 
     try:
         preds = model.predict(feat[MODEL_ALL_COLS])
@@ -1554,7 +1600,7 @@ def _lookup_attom_property_bundle(address: str) -> dict:
 
     _predict_address.API_KEY = ATTOM_KEY
     raw_property = _predict_address.get_property_data(address)
-    prediction = _run_easy_predict(raw_property)
+    prediction = _run_easy_predict_from_source(raw_property)
     property_record = _build_attom_property_record(address, raw_property, prediction)
     return {
         "property": property_record,
@@ -1563,9 +1609,10 @@ def _lookup_attom_property_bundle(address: str) -> dict:
     }
 
 
-def _run_easy_predict(raw_property: dict) -> dict:
+def _run_easy_predict_from_source(source_data: dict, base_estimate: float | None = None) -> dict:
     """
-    Run the Stage 1 valuation and Stage 2 forecast from an ATTOM property payload.
+    Run Stage 1 valuation and the Stage 2 forecast from any property source dict
+    that can be mapped to the model feature schema.
     Changes working directory to the project root so relative model paths resolve correctly.
     Returns a dict with valuation, forecast, and forecast-driver detail for the UI.
     """
@@ -1573,16 +1620,17 @@ def _run_easy_predict(raw_property: dict) -> dict:
     _orig_cwd = _os.getcwd()
     result = {"current": None, "future": None, "diff": None, "pct": None, "error": None}
     try:
-        from model_logic import predict as stage1_predict
-        from predict_address import build_feature_row
-
         stage1_model = load_valuation_model()
         if stage1_model is None:
             result["error"] = f"Valuation model not found at: {model_path}"
             return result
 
-        df_features = build_feature_row(raw_property)
-        base_value = float(stage1_predict(stage1_model, df_features)[0])
+        if pd.notna(_to_float(base_estimate)):
+            base_value = float(_to_float(base_estimate))
+        else:
+            df_features = _build_feature_frame_from_source(source_data)
+            base_preds = stage1_model.predict(df_features[MODEL_ALL_COLS])
+            base_value = float(np.array(base_preds, dtype=float)[0])
         result["current"] = base_value
 
         # round2_model loads artifacts using project-root-relative paths.
@@ -1594,8 +1642,8 @@ def _run_easy_predict(raw_property: dict) -> dict:
             fred_api_key=FRED_KEY,
             noaa_api_key=NOAA_KEY,
             epa_api_key=EPA_KEY,
-            zip_code=_to_text(raw_property.get("zip")) or None,
-            property_type=_to_text(raw_property.get("propertyType")) or _to_text(raw_property.get("propSubtype")) or None,
+            zip_code=_to_text(_get_source_value(source_data, "zip")) or None,
+            property_type=_to_text(_get_source_value(source_data, "propertyType")) or _to_text(_get_source_value(source_data, "propSubtype")) or None,
             verbose=False,
         )
         return {
@@ -1621,6 +1669,80 @@ def _run_easy_predict(raw_property: dict) -> dict:
         return result
     finally:
         _os.chdir(_orig_cwd)  # always restore original working directory
+
+
+def _run_easy_predict(raw_property: dict) -> dict:
+    return _run_easy_predict_from_source(raw_property)
+
+
+def _prediction_cache_key(property_record: dict) -> str | None:
+    source = _to_text(property_record.get("DATA_SOURCE")) or "property"
+    address = _to_text(property_record.get("ADDRESS"))
+    if address:
+        normalized_address = " ".join(address.lower().split())
+        return f"{source.lower()}_prediction_{normalized_address}"
+
+    lat = _to_float(property_record.get("LATITUDE"))
+    lng = _to_float(property_record.get("LONGITUDE"))
+    if pd.notna(lat) and pd.notna(lng):
+        return f"{source.lower()}_prediction_{lat:.6f}_{lng:.6f}"
+
+    return None
+
+
+def _enrich_property_with_prediction(
+    property_record: dict | None,
+    prediction: dict | None,
+) -> tuple[dict | None, dict | None]:
+    if property_record is None:
+        return None, prediction
+
+    if prediction is not None:
+        return property_record, prediction
+
+    source_data = property_record.get("MODEL_SOURCE")
+    if source_data is not None:
+        cache_key = _prediction_cache_key(property_record)
+        if cache_key not in st.session_state:
+            base_estimate = _first_valid_number(
+                property_record.get("MODEL_ESTIMATE"),
+                property_record.get("PREDICTED_VALUE"),
+            )
+            # Recompute the Stage 1 estimate for dataset-backed map clicks so the
+            # clicked panel, feature impacts, and forecast always share one base.
+            if _to_text(property_record.get("DATA_SOURCE")) == "DATASET":
+                base_estimate = None
+            with st.spinner("Running forecast for the selected property…"):
+                st.session_state[cache_key] = _run_easy_predict_from_source(
+                    source_data,
+                    base_estimate=base_estimate,
+                )
+
+        prediction = st.session_state.get(cache_key)
+        if prediction is not None and not prediction.get("error"):
+            property_record = property_record.copy()
+            current_value = _to_float(prediction.get("current"))
+            if pd.notna(current_value):
+                property_record["PREDICTED_VALUE"] = current_value
+                property_record["MODEL_ESTIMATE"] = current_value
+        return property_record, prediction
+
+    if _to_text(property_record.get("DATA_SOURCE")) == "PINS_ONLY":
+        address = _to_text(property_record.get("ADDRESS"))
+        if address:
+            cache_key = f"attom_property_{_normalize_addr(address)}"
+            if cache_key not in st.session_state:
+                with st.spinner("Looking up the selected property and running AI valuation…"):
+                    try:
+                        st.session_state[cache_key] = _lookup_attom_property_bundle(address)
+                    except Exception as e:
+                        st.session_state[cache_key] = {"property": None, "prediction": None, "error": str(e)}
+
+            bundle = st.session_state.get(cache_key, {})
+            if bundle.get("property") is not None:
+                return bundle.get("property"), bundle.get("prediction")
+
+    return property_record, prediction
 
 if not os.path.exists(csv_path):
     st.error(f"CSV not found at: {csv_path}")
@@ -2877,6 +2999,11 @@ clicked_property, clicked_prediction = _resolve_clicked_property(
     map_market_df,
 )
 
+clicked_property, clicked_prediction = _enrich_property_with_prediction(
+    clicked_property,
+    clicked_prediction,
+)
+
 panel_state_key = "active_property_panel_state"
 stored_panel_state = st.session_state.get(panel_state_key)
 if stored_panel_state and stored_panel_state.get("map_context") != map_key_sfx:
@@ -2904,6 +3031,18 @@ elif searched_property is None and stored_panel_state is None:
 
 active_property = stored_panel_state.get("property") if stored_panel_state else None
 active_prediction = stored_panel_state.get("prediction") if stored_panel_state else None
+
+if active_property is not None and stored_panel_state and stored_panel_state.get("source") == "map":
+    enriched_property, enriched_prediction = _enrich_property_with_prediction(active_property, active_prediction)
+    if enriched_property is not active_property or enriched_prediction is not active_prediction:
+        stored_panel_state = {
+            **stored_panel_state,
+            "property": enriched_property,
+            "prediction": enriched_prediction,
+        }
+        st.session_state[panel_state_key] = stored_panel_state
+        active_property = enriched_property
+        active_prediction = enriched_prediction
 
 with stat_col:
     above_count = int((price_series >= price_med).sum()) if price_series.notna().any() else 0
