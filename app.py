@@ -5,6 +5,7 @@ import pandas as pd
 import streamlit as st
 from streamlit_folium import st_folium
 import folium
+from folium.plugins import FastMarkerCluster
 import streamlit.components.v1 as components
 import joblib
 import xgboost as xgb
@@ -35,6 +36,10 @@ csv_path = _resolve_existing_path(
     os.path.join("data", "dfw_real_estate.csv"),
     "Dallas_properties_combined.csv",
     "Combined_Dallas_Properties.csv",
+)
+pins_csv_path = _resolve_existing_path(
+    "PinsOnlyProperties.csv",
+    os.path.join("data", "PinsOnlyProperties.csv"),
 )
 model_path = _resolve_existing_path(
     "VER4_property_valuation_model.joblib",
@@ -175,6 +180,20 @@ CURRENCY_FEATURES = {
 AREA_FEATURES = {"sqft", "livingArea", "grossSqft", "groundFloorSqft", "lotSqft", "basementSqft", "garageSize"}
 COUNT_FEATURES = {"beds", "bathsFull", "bathsHalf", "bathsTotal", "totalRooms", "stories", "garageSpaces", "fireplaces"}
 YEAR_FEATURES = {"yearBuilt", "yearBuiltEffective", "taxYear", "saleYear"}
+PIN_MAP_COLUMNS = [
+    "ADDRESS",
+    "CITY",
+    "LATITUDE",
+    "LONGITUDE",
+    "PRICE",
+    "PRICE_LABEL",
+    "SALE_PRICE",
+    "ATTOM_AVM",
+    "BEDS",
+    "BATHS",
+    "SQUARE FEET",
+    "PRICE_PER_SQFT_FINAL",
+]
 
 FEATURE_GROUPS = [
     {
@@ -230,6 +249,103 @@ FEATURE_GROUPS = [
         ],
     },
 ]
+
+FORECAST_FACTOR_LABELS = {
+    "mortgage_rate_30yr": "30-Year Mortgage Rate",
+    "mortgage_rate_30yr_lag1": "Mortgage Rate (1M Ago)",
+    "mortgage_rate_mom": "Mortgage Rate MoM Change",
+    "mortgage_rate_3mo_change": "Mortgage Rate 3M Change",
+    "fed_funds_rate": "Fed Funds Rate",
+    "fed_funds_rate_lag1": "Fed Funds Rate (1M Ago)",
+    "treasury_10yr": "10-Year Treasury",
+    "treasury_2yr": "2-Year Treasury",
+    "yield_spread": "Yield Spread (10Y-2Y)",
+    "rate_vs_10yr": "Fed Funds vs 10Y Treasury",
+    "affordability_stress": "Affordability Stress",
+    "case_shiller_dallas": "Dallas Case-Shiller Index",
+    "cs_dallas_mom_pct": "Dallas Price Momentum (1M)",
+    "cs_dallas_mom_pct_lag1": "Dallas Price Momentum (1M Ago)",
+    "cs_dallas_3mo_pct": "Dallas Price Momentum (3M)",
+    "cs_momentum_divergence": "Momentum Divergence",
+    "housing_starts_south": "Housing Starts (South)",
+    "existing_home_sales": "Existing Home Sales",
+    "new_home_sales": "New Home Sales",
+    "homebuilder_etf_return": "Homebuilder ETF Return",
+    "homebuilder_etf_return_lag1": "Homebuilder ETF Return (1M Ago)",
+    "cpi_shelter": "CPI Shelter",
+    "unemployment_texas": "Texas Unemployment",
+    "labor_force_part_texas": "TX Labor Force Participation",
+    "wage_growth_texas": "TX Wage Growth",
+    "sp500_return": "S&P 500 Return",
+    "sp500_return_lag1": "S&P 500 Return (1M Ago)",
+    "reit_index_return": "REIT Index Return",
+    "vix": "VIX",
+    "vix_lag1": "VIX (1M Ago)",
+    "oil_wti": "WTI Oil",
+    "txn_stock_return": "TXN Stock Return",
+    "att_stock_return": "AT&T Stock Return",
+    "treasury_etf_return": "Treasury ETF Return",
+    "month": "Month Seasonality",
+    "quarter": "Quarter Seasonality",
+    "is_spring": "Spring Seasonality",
+    "is_summer": "Summer Seasonality",
+}
+
+FORECAST_FACTOR_GROUPS = [
+    {
+        "name": "Rates & Affordability",
+        "description": "Borrowing costs, Treasury structure, and affordability pressure in the macro model.",
+        "features": [
+            "mortgage_rate_30yr", "mortgage_rate_30yr_lag1", "mortgage_rate_mom",
+            "mortgage_rate_3mo_change", "fed_funds_rate", "fed_funds_rate_lag1",
+            "treasury_10yr", "treasury_2yr", "yield_spread", "rate_vs_10yr",
+            "affordability_stress",
+        ],
+    },
+    {
+        "name": "Housing Market Momentum",
+        "description": "Housing supply, transaction pace, and Dallas home-price momentum.",
+        "features": [
+            "case_shiller_dallas", "cs_dallas_mom_pct", "cs_dallas_mom_pct_lag1",
+            "cs_dallas_3mo_pct", "cs_momentum_divergence", "housing_starts_south",
+            "existing_home_sales", "new_home_sales", "homebuilder_etf_return",
+            "homebuilder_etf_return_lag1",
+        ],
+    },
+    {
+        "name": "Labor & Inflation",
+        "description": "Labor-market and cost-of-living conditions that affect housing demand.",
+        "features": [
+            "cpi_shelter", "unemployment_texas", "labor_force_part_texas", "wage_growth_texas",
+        ],
+    },
+    {
+        "name": "Capital Markets & Risk Appetite",
+        "description": "Broader market sentiment, volatility, and sector-specific pricing signals.",
+        "features": [
+            "sp500_return", "sp500_return_lag1", "reit_index_return", "vix", "vix_lag1",
+            "oil_wti", "txn_stock_return", "att_stock_return", "treasury_etf_return",
+        ],
+    },
+    {
+        "name": "Seasonality",
+        "description": "Calendar effects the forecast model uses to account for recurring market patterns.",
+        "features": ["month", "quarter", "is_spring", "is_summer"],
+    },
+]
+
+FORECAST_LEVEL_PERCENT_FEATURES = {
+    "mortgage_rate_30yr", "mortgage_rate_30yr_lag1", "fed_funds_rate", "fed_funds_rate_lag1",
+    "treasury_10yr", "treasury_2yr", "unemployment_texas", "labor_force_part_texas",
+    "wage_growth_texas", "cs_dallas_mom_pct", "cs_dallas_mom_pct_lag1", "cs_dallas_3mo_pct",
+    "sp500_return", "sp500_return_lag1", "homebuilder_etf_return", "homebuilder_etf_return_lag1",
+    "reit_index_return", "txn_stock_return", "att_stock_return", "treasury_etf_return",
+}
+FORECAST_POINT_FEATURES = {
+    "yield_spread", "mortgage_rate_mom", "mortgage_rate_3mo_change",
+    "rate_vs_10yr", "cs_momentum_divergence",
+}
+FORECAST_BOOLEAN_FEATURES = {"is_spring", "is_summer"}
 
 @st.cache_resource
 def load_valuation_model():
@@ -577,6 +693,222 @@ def _render_feature_impact_section(property_record: dict, market_df: pd.DataFram
 </div>
 """
 
+
+def _format_forecast_factor_value(feature_name: str, raw_value) -> str:
+    number = _to_float(raw_value)
+    if pd.isna(number):
+        return "N/A"
+
+    if feature_name in FORECAST_BOOLEAN_FEATURES:
+        return "Yes" if int(round(number)) == 1 else "No"
+
+    if feature_name == "month":
+        month_num = max(1, min(12, int(round(number))))
+        return pd.Timestamp(2000, month_num, 1).strftime("%B")
+
+    if feature_name == "quarter":
+        return f"Q{max(1, min(4, int(round(number))))}"
+
+    if feature_name in FORECAST_POINT_FEATURES:
+        return f"{number:+.2f} pts"
+
+    if feature_name in FORECAST_LEVEL_PERCENT_FEATURES:
+        sign = "+" if feature_name in {
+            "cs_dallas_mom_pct", "cs_dallas_mom_pct_lag1", "cs_dallas_3mo_pct",
+            "sp500_return", "sp500_return_lag1", "homebuilder_etf_return",
+            "homebuilder_etf_return_lag1", "reit_index_return",
+            "txn_stock_return", "att_stock_return", "treasury_etf_return",
+        } else ""
+        return f"{sign}{number:.2f}%"
+
+    if feature_name in {"housing_starts_south", "existing_home_sales", "new_home_sales"}:
+        return _format_metric_value(number, decimals=1)
+
+    return _format_metric_value(number, decimals=2)
+
+
+def _group_forecast_factors(factors: list[dict]) -> list[dict]:
+    groups = []
+    assigned_features = set()
+
+    for group in FORECAST_FACTOR_GROUPS:
+        group_factors = [factor for factor in factors if factor.get("feature") in group["features"]]
+        if not group_factors:
+            continue
+
+        group_factors.sort(key=lambda item: abs(_to_float(item.get("shap_dollar"))), reverse=True)
+        group_impact = sum(
+            value for value in (_to_float(factor.get("shap_dollar")) for factor in group_factors)
+            if pd.notna(value)
+        )
+        groups.append({
+            "name": group["name"],
+            "description": group["description"],
+            "impact": float(group_impact),
+            "factors": group_factors,
+        })
+        assigned_features.update(factor.get("feature") for factor in group_factors)
+
+    other_factors = [factor for factor in factors if factor.get("feature") not in assigned_features]
+    if other_factors:
+        other_factors.sort(key=lambda item: abs(_to_float(item.get("shap_dollar"))), reverse=True)
+        other_impact = sum(
+            value for value in (_to_float(factor.get("shap_dollar")) for factor in other_factors)
+            if pd.notna(value)
+        )
+        groups.append({
+            "name": "Other Signals",
+            "description": "Remaining forecast inputs that were not part of the main macro groupings above.",
+            "impact": float(other_impact),
+            "factors": other_factors,
+        })
+
+    return groups
+
+
+def _render_forecast_factor_rows(factors: list[dict]) -> str:
+    rows = []
+
+    for factor in factors:
+        feature_name = _to_text(factor.get("feature"))
+        label = html.escape(FORECAST_FACTOR_LABELS.get(feature_name, feature_name.replace("_", " ").title()))
+        raw_value = html.escape(_format_forecast_factor_value(feature_name, factor.get("raw_value")))
+        impact = _to_float(factor.get("shap_dollar"))
+        impact_pct = _to_float(factor.get("shap_pct"))
+        if pd.isna(impact):
+            continue
+        positive = impact >= 0
+        color = "#2ce4df" if positive else "#e7c65a"
+        impact_label = f"{'+' if positive else '-'}${abs(impact):,.0f}"
+        pct_label = f"{impact_pct:+.2f} forecast pts" if pd.notna(impact_pct) else "Directional signal"
+
+        rows.append(f"""
+<div class="feature-driver-row">
+  <div style="min-width:0;">
+    <div class="feature-driver-label">{label}</div>
+    <div class="feature-driver-value">{raw_value} · {pct_label}</div>
+  </div>
+  <div class="feature-driver-impact" style="color:{color};">{impact_label}</div>
+</div>
+""")
+
+    return "".join(rows)
+
+
+def _render_forecast_explanation_section(property_record: dict, prediction: dict | None = None) -> str:
+    if prediction is None:
+        return ""
+
+    if prediction.get("error"):
+        return f"""
+<div style="background:#0b1c30;border:1px solid rgba(231,198,90,0.18);border-radius:18px;padding:18px 20px;">
+  <div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.14em;color:#e7c65a;margin-bottom:6px;">Forecast Drivers</div>
+  <div style="font-size:11px;color:#8baec8;line-height:1.6;">{html.escape(str(prediction.get('error', 'Forecast unavailable'))[:180])}</div>
+</div>
+"""
+
+    factors = prediction.get("shap_factors") or []
+    if not factors:
+        return ""
+
+    grouped_factors = _group_forecast_factors(factors)
+    market_signal = _to_float(prediction.get("macro_pct"))
+    combined_beta = _to_float(prediction.get("combined_beta"))
+    future_low = _to_float(prediction.get("estimate_low"))
+    future_high = _to_float(prediction.get("estimate_high"))
+    diff = _to_float(prediction.get("diff"))
+    pct = _to_float(prediction.get("pct"))
+    price_beta = _to_float(prediction.get("price_beta"))
+    zip_beta = _to_float(prediction.get("zip_beta"))
+    type_beta = _to_float(prediction.get("type_beta"))
+    price_tier = _to_text(prediction.get("price_tier")) or "Unknown price tier"
+    zip_tier = _to_text(prediction.get("zip_tier")) or "Unknown ZIP tier"
+    property_type = _to_text(property_record.get("PROPERTY TYPE")) or "Residential"
+
+    change_label = (
+        f"{'+' if diff >= 0 else '-'}${abs(diff):,.0f}"
+        if pd.notna(diff) else "N/A"
+    )
+    change_sub = (
+        f"{pct:+.2f}% in 6 months"
+        if pd.notna(pct) else "Projected 6-month change"
+    )
+    market_signal_label = f"{market_signal:+.2f}%" if pd.notna(market_signal) else "N/A"
+    combined_beta_label = f"×{combined_beta:.3f}" if pd.notna(combined_beta) else "N/A"
+    forecast_range_label = (
+        f"{_format_currency(future_low)} to {_format_currency(future_high)}"
+        if pd.notna(future_low) and pd.notna(future_high) else "N/A"
+    )
+    combined_beta_sub = (
+        f"Price β {price_beta:.2f} ({html.escape(price_tier)}) · "
+        f"ZIP β {zip_beta:.2f} ({html.escape(zip_tier)}) · "
+        f"Type β {type_beta:.2f} ({html.escape(property_type)})"
+        if pd.notna(price_beta) and pd.notna(zip_beta) and pd.notna(type_beta)
+        else "Property-specific beta adjustment"
+    )
+
+    group_cards = []
+    for group in grouped_factors:
+        group_impact = _to_float(group.get("impact"))
+        group_positive = group_impact >= 0
+        group_color = "#2ce4df" if group_positive else "#e7c65a"
+        group_total = f"{'+' if group_positive else '-'}${abs(group_impact):,.0f}"
+        group_cards.append(f"""
+<div class="feature-group-card">
+  <div class="feature-group-head">
+    <div>
+      <div class="feature-group-name">{html.escape(group['name'])}</div>
+      <div class="feature-group-desc">{html.escape(group['description'])}</div>
+    </div>
+    <div class="feature-group-total" style="color:{group_color};">{group_total}</div>
+  </div>
+  <div class="feature-group-body">
+    {_render_forecast_factor_rows(group['factors'])}
+  </div>
+</div>
+""")
+
+    return f"""
+<div class="feature-impact-panel">
+  <div class="feature-impact-summary">
+    <div>
+      <div class="feature-impact-kicker">6-Month Forecast Drivers</div>
+      <div class="feature-impact-title">Why The Forecast Moves</div>
+      <div class="feature-impact-copy">
+        The 6-month forecast still uses outside signals like interest rates, labor conditions, stock-market sentiment, and housing-market momentum. 
+        The grouped totals below show the strongest directional XGBoost macro signals; the final forecast also blends a ridge model and applies property-specific beta adjustments.
+      </div>
+    </div>
+    <div class="feature-impact-metrics">
+      <div class="feature-impact-metric">
+        <div class="feature-impact-metric-label">DFW Market Signal</div>
+        <div class="feature-impact-metric-value">{market_signal_label}</div>
+        <div class="feature-impact-metric-sub">Macro model output before property-specific adjustments.</div>
+      </div>
+      <div class="feature-impact-metric">
+        <div class="feature-impact-metric-label">Combined Property Beta</div>
+        <div class="feature-impact-metric-value">{combined_beta_label}</div>
+        <div class="feature-impact-metric-sub">{combined_beta_sub}</div>
+      </div>
+      <div class="feature-impact-metric">
+        <div class="feature-impact-metric-label">Projected Change</div>
+        <div class="feature-impact-metric-value feature-impact-metric-value-blue">{change_label}</div>
+        <div class="feature-impact-metric-sub">{change_sub}</div>
+      </div>
+      <div class="feature-impact-metric">
+        <div class="feature-impact-metric-label">80% Forecast Range</div>
+        <div class="feature-impact-metric-value">{forecast_range_label}</div>
+        <div class="feature-impact-metric-sub">Modeled low-to-high range for the 6-month estimate.</div>
+      </div>
+    </div>
+  </div>
+  <div class="feature-impact-grid">
+    {''.join(group_cards)}
+  </div>
+</div>
+"""
+
+
 def _predict_valuations(model, df_raw: pd.DataFrame) -> np.ndarray:
     """
     Run the valuation model over the raw CSV dataframe.
@@ -603,6 +935,83 @@ def _predict_valuations(model, df_raw: pd.DataFrame) -> np.ndarray:
     except Exception as e:
         st.warning(f"Model prediction failed: {e}")
         return np.zeros(len(df_raw))
+
+
+def _extract_pin_city_series(addresses: pd.Series) -> pd.Series:
+    address_text = addresses.fillna("").astype(str).str.strip()
+    direct_city = address_text.str.extract(
+        r"^\s*[^,]+,\s*([^,]+?)\s*,\s*[A-Za-z]{2}(?:\s+\d{5}(?:-\d{4})?)?\s*$",
+        expand=False,
+    )
+    fallback_city = address_text.str.split(",").str[1].fillna("").str.strip()
+    fallback_city = fallback_city.where(
+        ~fallback_city.str.match(r"^[A-Za-z]{2}(?:\s+\d{5}(?:-\d{4})?)?$"),
+        "",
+    )
+    city_series = direct_city.fillna("")
+    city_series = city_series.where(city_series.ne(""), fallback_city)
+    return city_series.str.replace(r"\s+", " ", regex=True).str.strip()
+
+
+@st.cache_data(ttl=3600)
+def load_pin_map_data(city: str | None = None) -> pd.DataFrame:
+    if not os.path.exists(pins_csv_path):
+        return pd.DataFrame(columns=PIN_MAP_COLUMNS)
+
+    city_key = _normalize_location_key(city)
+    usecols = ["address", "latitude", "longitude", "last_sale_price", "beds", "baths", "sq_ft", "attom_avm"]
+    rename_map = {
+        "address": "ADDRESS",
+        "latitude": "LATITUDE",
+        "longitude": "LONGITUDE",
+        "last_sale_price": "SALE_PRICE",
+        "beds": "BEDS",
+        "baths": "BATHS",
+        "sq_ft": "SQUARE FEET",
+        "attom_avm": "ATTOM_AVM",
+    }
+    frames: list[pd.DataFrame] = []
+
+    try:
+        reader = pd.read_csv(
+            pins_csv_path,
+            usecols=usecols,
+            chunksize=50000,
+            low_memory=False,
+        )
+    except ValueError:
+        return pd.DataFrame(columns=PIN_MAP_COLUMNS)
+
+    for chunk in reader:
+        chunk = chunk.rename(columns=rename_map)
+        chunk["ADDRESS"] = chunk["ADDRESS"].fillna("").astype(str).str.strip()
+        chunk["CITY"] = _extract_pin_city_series(chunk["ADDRESS"]).str.title()
+
+        if city_key:
+            chunk = chunk.loc[chunk["CITY"].astype(str).str.strip().str.lower() == city_key].copy()
+            if chunk.empty:
+                continue
+
+        frames.append(chunk)
+
+    if not frames:
+        return pd.DataFrame(columns=PIN_MAP_COLUMNS)
+
+    df = pd.concat(frames, ignore_index=True)
+
+    for col in ["LATITUDE", "LONGITUDE", "SALE_PRICE", "BEDS", "BATHS", "SQUARE FEET", "ATTOM_AVM"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna(subset=["LATITUDE", "LONGITUDE"]).copy()
+    df["PRICE"] = df["SALE_PRICE"].where(df["SALE_PRICE"].notna(), df["ATTOM_AVM"])
+    df["PRICE_LABEL"] = np.where(df["SALE_PRICE"].notna(), "Latest Sale Price", "ATTOM AVM")
+    df["PRICE_PER_SQFT_FINAL"] = np.where(
+        df["SQUARE FEET"].gt(0),
+        df["PRICE"] / df["SQUARE FEET"],
+        np.nan,
+    )
+
+    return df[PIN_MAP_COLUMNS].copy()
 
 @st.cache_data(ttl=3600)
 def load_real_estate_data():
@@ -840,7 +1249,7 @@ def _build_attom_property_record(address: str, raw_property: dict, prediction: d
 
 def _build_market_property_record(row: pd.Series) -> dict:
     sale_price = _first_valid_number(row.get("PRICE"), row.get("salePrice"))
-    avm_value = _to_float(row.get("avmValue"))
+    avm_value = _first_valid_number(row.get("ATTOM_AVM"), row.get("attom_avm"), row.get("avmValue"))
     model_estimate = _to_float(row.get("PREDICTED_VALUE"))
     city = _to_text(row.get("CITY") if "CITY" in row else row.get("city"))
     zip_code = _to_text(row.get("ZIP") if "ZIP" in row else row.get("zip"))
@@ -869,6 +1278,42 @@ def _build_market_property_record(row: pd.Series) -> dict:
     }
 
 
+def _build_pin_property_record(row: pd.Series) -> dict:
+    sale_price = _first_valid_number(row.get("SALE_PRICE"), row.get("last_sale_price"))
+    avm_value = _first_valid_number(row.get("ATTOM_AVM"), row.get("attom_avm"))
+    price_value = sale_price if pd.notna(sale_price) else avm_value
+    address = _to_text(row.get("ADDRESS") if "ADDRESS" in row else row.get("address"))
+    city = _to_text(row.get("CITY") if "CITY" in row else row.get("city"))
+    sqft_value = _first_valid_number(row.get("SQUARE FEET"), row.get("sq_ft"))
+    price_per_sqft = _to_float(row.get("PRICE_PER_SQFT_FINAL"))
+    if pd.isna(price_per_sqft) and pd.notna(price_value) and pd.notna(sqft_value) and sqft_value > 0:
+        price_per_sqft = price_value / sqft_value
+
+    return {
+        "ADDRESS": address,
+        "CITY": city,
+        "PRICE": price_value,
+        "PRICE_LABEL": "Latest Sale Price" if pd.notna(sale_price) else "ATTOM AVM",
+        "SALE_PRICE": sale_price,
+        "ATTOM_AVM": avm_value,
+        "BEDS": _to_float(row.get("BEDS") if "BEDS" in row else row.get("beds")),
+        "BATHS": _to_float(row.get("BATHS") if "BATHS" in row else row.get("baths")),
+        "SQUARE FEET": sqft_value,
+        "YEAR BUILT": np.nan,
+        "PROPERTY TYPE": "Residential",
+        "LOT SIZE": np.nan,
+        "$/SQUARE FEET": price_per_sqft,
+        "PRICE_PER_SQFT_FINAL": price_per_sqft,
+        "LATITUDE": _to_float(row.get("LATITUDE") if "LATITUDE" in row else row.get("latitude")),
+        "LONGITUDE": _to_float(row.get("LONGITUDE") if "LONGITUDE" in row else row.get("longitude")),
+        "PREDICTED_VALUE": np.nan,
+        "MODEL_ESTIMATE": np.nan,
+        "ZIP": "",
+        "DATA_SOURCE": "PINS_ONLY",
+        "MODEL_SOURCE": None,
+    }
+
+
 def _coords_match(lat1, lng1, lat2, lng2, tol: float = 1e-6) -> bool:
     lat1 = _to_float(lat1)
     lng1 = _to_float(lng1)
@@ -889,11 +1334,12 @@ def _resolve_clicked_property(
     map_df: pd.DataFrame,
     searched_property: dict | None,
     searched_prediction: dict | None,
+    market_lookup_df: pd.DataFrame | None = None,
 ) -> tuple[dict | None, dict | None]:
     if not map_state:
         return None, None
 
-    clicked = map_state.get("last_object_clicked")
+    clicked = map_state.get("last_object_clicked") or map_state.get("last_clicked")
     if not clicked:
         return None, None
 
@@ -914,7 +1360,15 @@ def _resolve_clicked_property(
     if matched_rows.empty:
         return None, None
 
-    return _build_market_property_record(matched_rows.iloc[0]), None
+    if market_lookup_df is not None and not market_lookup_df.empty:
+        market_match = market_lookup_df[
+            (market_lookup_df["LATITUDE"].sub(click_lat).abs() <= 1e-6)
+            & (market_lookup_df["LONGITUDE"].sub(click_lng).abs() <= 1e-6)
+        ]
+        if not market_match.empty:
+            return _build_market_property_record(market_match.iloc[0]), None
+
+    return _build_pin_property_record(matched_rows.iloc[0]), None
 
 
 def _format_currency(value, fallback: str = "N/A") -> str:
@@ -1113,7 +1567,7 @@ def _run_easy_predict(raw_property: dict) -> dict:
     """
     Run the Stage 1 valuation and Stage 2 forecast from an ATTOM property payload.
     Changes working directory to the project root so relative model paths resolve correctly.
-    Returns a dict with keys: current, future, diff, pct, error
+    Returns a dict with valuation, forecast, and forecast-driver detail for the UI.
     """
     import os as _os
     _orig_cwd = _os.getcwd()
@@ -1145,11 +1599,22 @@ def _run_easy_predict(raw_property: dict) -> dict:
             verbose=False,
         )
         return {
-            "current": base_value,
-            "future":  result.get("forward_estimate", base_value),
-            "diff":    result.get("change_dollars", 0),
-            "pct":     result.get("change_pct", 0),
-            "error":   None,
+            "current":         base_value,
+            "future":          result.get("forward_estimate", base_value),
+            "diff":            result.get("change_dollars", 0),
+            "pct":             result.get("change_pct", 0),
+            "estimate_low":    result.get("estimate_low"),
+            "estimate_high":   result.get("estimate_high"),
+            "macro_pct":       result.get("macro_pct"),
+            "price_beta":      result.get("price_beta"),
+            "zip_beta":        result.get("zip_beta"),
+            "type_beta":       result.get("type_beta"),
+            "combined_beta":   result.get("combined_beta"),
+            "price_tier":      result.get("price_tier"),
+            "zip_tier":        result.get("zip_tier"),
+            "shap_factors":    result.get("shap_factors", []),
+            "macro_snapshot":  result.get("macro_snapshot", {}),
+            "error":           None,
         }
     except Exception as e:
         result["error"] = str(e)
@@ -2243,9 +2708,9 @@ searched_has_coords = (
 
 if searched_property is not None:
     _map_city = searched_property.get("CITY") or target_city
-    map_source_df = df[df["CITY"].str.lower() == _map_city.lower()].copy() if _map_city else city_df.copy()
-    if map_source_df.empty:
-        map_source_df = city_df.copy()
+    map_market_df = df[df["CITY"].str.lower() == _map_city.lower()].copy() if _map_city else city_df.copy()
+    if map_market_df.empty:
+        map_market_df = city_df.copy()
     if searched_has_coords:
         location = [searched_property["LATITUDE"], searched_property["LONGITUDE"]]
         map_zoom = 16
@@ -2253,24 +2718,37 @@ if searched_property is not None:
         location = city_coords.get(_map_city, city_coords.get(target_city, [city_df["LATITUDE"].mean(), city_df["LONGITUDE"].mean()]))
         map_zoom = 11
     map_key_sfx = f"search_{address_query}"
+    map_scope_city = _map_city
 else:
-    map_source_df = city_df.copy()
+    map_market_df = city_df.copy()
     location      = city_coords.get(target_city, city_coords.get(target_city.title(),
                     [city_df["LATITUDE"].mean(), city_df["LONGITUDE"].mean()]))
     map_zoom      = 11
     map_key_sfx   = target_city
+    map_scope_city = target_city
 
-map_df = map_source_df.dropna(subset=["LATITUDE", "LONGITUDE"]).copy()
-if len(map_df) > 400:
-    map_df = map_df.sample(400, random_state=42)
-price_med = map_df["PRICE"].median() if "PRICE" in map_df.columns and map_df["PRICE"].notna().any() else 0
+map_df = load_pin_map_data(map_scope_city)
+using_pins_only_map = not map_df.empty
+if map_df.empty:
+    map_df = map_market_df.dropna(subset=["LATITUDE", "LONGITUDE"]).copy()
+    if len(map_df) > 400:
+        map_df = map_df.sample(400, random_state=42)
 
-fmap = folium.Map(location=location, zoom_start=map_zoom, tiles="CartoDB dark_matter")
+price_series = map_df["PRICE"] if "PRICE" in map_df.columns else pd.Series(dtype=float)
+price_series = pd.to_numeric(price_series, errors="coerce")
+price_med = price_series.median() if price_series.notna().any() else 0
+
+fmap = folium.Map(location=location, zoom_start=map_zoom, tiles="CartoDB dark_matter", prefer_canvas=True)
+use_fast_cluster = len(map_df) > 5000
+fast_marker_rows: list[list] = []
+map_scope_label = "PinsOnlyProperties.csv scope" if using_pins_only_map else "Listing dataset fallback"
+if use_fast_cluster and using_pins_only_map:
+    map_scope_label = "PinsOnlyProperties.csv scope · clustered"
 
 for _, row in map_df.iterrows():
     price_val = row.get("PRICE") if "PRICE" in row else None
     pred_val  = row.get("PREDICTED_VALUE") if "PREDICTED_VALUE" in row else None
-    avm_val   = row.get("avmValue")
+    avm_val   = _first_valid_number(row.get("ATTOM_AVM"), row.get("attom_avm"), row.get("avmValue"))
     price_label = row.get("PRICE_LABEL", "Latest Sale Price" if pd.notna(price_val) else "ATTOM AVM")
     above = (pd.notna(price_val) and price_val >= price_med)
     mc = "#2ce4df" if above else "#e7c65a"
@@ -2293,14 +2771,51 @@ for _, row in map_df.iterrows():
         "min-width:170px;line-height:1.7;'>"
         + "<br>".join(parts) + "</div>"
     )
-    folium.CircleMarker(
-        [row["LATITUDE"], row["LONGITUDE"]],
-        radius=5.5,
-        popup=folium.Popup(popup_html, max_width=260),
-        tooltip=_compose_display_address(row.get("ADDRESS"), row.get("CITY"), row.get("zip")),
-        color=mc, fill=True, fill_color=mc,
-        fill_opacity=0.88 if above else 0.72, weight=1.4,
-    ).add_to(fmap)
+    tooltip_text = _to_text(row.get("ADDRESS")) or _compose_display_address(row.get("ADDRESS"), row.get("CITY"), row.get("zip"))
+    fill_opacity = 0.88 if above else 0.72
+
+    if use_fast_cluster:
+        fast_marker_rows.append([
+            row["LATITUDE"],
+            row["LONGITUDE"],
+            popup_html,
+            tooltip_text,
+            mc,
+            fill_opacity,
+        ])
+    else:
+        folium.CircleMarker(
+            [row["LATITUDE"], row["LONGITUDE"]],
+            radius=5.5,
+            popup=folium.Popup(popup_html, max_width=260),
+            tooltip=tooltip_text,
+            color=mc,
+            fill=True,
+            fill_color=mc,
+            fill_opacity=fill_opacity,
+            weight=1.4,
+        ).add_to(fmap)
+
+if use_fast_cluster and fast_marker_rows:
+    cluster_callback = """
+    function (row) {
+        var marker = L.circleMarker(new L.LatLng(row[0], row[1]), {
+            radius: 5.5,
+            color: row[4],
+            weight: 1.4,
+            fillColor: row[4],
+            fillOpacity: row[5]
+        });
+        if (row[2]) {
+            marker.bindPopup(row[2], {maxWidth: 260});
+        }
+        if (row[3]) {
+            marker.bindTooltip(row[3]);
+        }
+        return marker;
+    }
+    """
+    FastMarkerCluster(fast_marker_rows, callback=cluster_callback).add_to(fmap)
 
 # If a searched property exists, add a glowing highlighted marker on top
 if searched_property is not None and searched_has_coords:
@@ -2350,7 +2865,7 @@ with map_col:
         width="100%",
         height=400,
         key=f"map_{map_key_sfx}",
-        returned_objects=["last_object_clicked"],
+        returned_objects=["last_object_clicked", "last_clicked"],
     )
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -2359,6 +2874,7 @@ clicked_property, clicked_prediction = _resolve_clicked_property(
     map_df,
     searched_property,
     easy_predict_result,
+    map_market_df,
 )
 
 panel_state_key = "active_property_panel_state"
@@ -2390,10 +2906,10 @@ active_property = stored_panel_state.get("property") if stored_panel_state else 
 active_prediction = stored_panel_state.get("prediction") if stored_panel_state else None
 
 with stat_col:
-    above_count = int((map_df["PRICE"] >= price_med).sum())
-    below_count = int((map_df["PRICE"] < price_med).sum())
-    max_price = map_df["PRICE"].max()
-    min_price = map_df["PRICE"].min()
+    above_count = int((price_series >= price_med).sum()) if price_series.notna().any() else 0
+    below_count = int((price_series < price_med).sum()) if price_series.notna().any() else 0
+    max_price = price_series.max() if price_series.notna().any() else np.nan
+    min_price = price_series.min() if price_series.notna().any() else np.nan
 
     if active_property is not None:
         st.markdown(_render_property_panel(active_property, active_prediction), unsafe_allow_html=True)
@@ -2402,15 +2918,15 @@ with stat_col:
         st.markdown(f"""
 <div style="display:flex;flex-direction:column;gap:12px;padding:4px 0;">
   <div style="background:#0b1c30;border:1px solid rgba(44,228,223,0.10);border-radius:14px;padding:16px 18px;">
-    <div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.14em;color:#567592;margin-bottom:6px;">Mapped Listings</div>
+    <div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.14em;color:#567592;margin-bottom:6px;">Mapped Property Pins</div>
     <div style="font-family:'Sora',sans-serif;font-size:26px;font-weight:800;color:#ecf6ff;letter-spacing:-0.04em;">{len(map_df):,}</div>
-    <div style="font-size:11px;color:#567592;margin-top:2px;">properties plotted</div>
+    <div style="font-size:11px;color:#567592;margin-top:2px;">{map_scope_label}</div>
   </div>
   <div style="background:#0b1c30;border:1px solid rgba(44,228,223,0.10);border-radius:14px;padding:16px 18px;">
-    <div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.14em;color:#567592;margin-bottom:10px;">Price Distribution</div>
+    <div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.14em;color:#567592;margin-bottom:10px;">Visible Price Split</div>
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
       <span style="width:8px;height:8px;border-radius:50%;background:#2ce4df;flex-shrink:0;box-shadow:0 0 6px #2ce4df;"></span>
-      <span style="font-size:12px;color:#8baec8;">Above median</span>
+      <span style="font-size:12px;color:#8baec8;">At or above median</span>
       <span style="margin-left:auto;font-family:'Sora',sans-serif;font-size:13px;font-weight:700;color:#ecf6ff;">{above_count}</span>
     </div>
     <div style="display:flex;align-items:center;gap:8px;">
@@ -2420,20 +2936,21 @@ with stat_col:
     </div>
   </div>
   <div style="background:#0b1c30;border:1px solid rgba(44,228,223,0.10);border-radius:14px;padding:16px 18px;">
-    <div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.14em;color:#567592;margin-bottom:10px;">Price Range</div>
+    <div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.14em;color:#567592;margin-bottom:10px;">Visible Price Range</div>
     <div style="font-size:11px;color:#567592;margin-bottom:3px;">Highest</div>
-    <div style="font-family:'Sora',sans-serif;font-size:13px;font-weight:700;color:#2ce4df;margin-bottom:8px;">${max_price:,.0f}</div>
+    <div style="font-family:'Sora',sans-serif;font-size:13px;font-weight:700;color:#2ce4df;margin-bottom:8px;">{_format_currency(max_price)}</div>
     <div style="font-size:11px;color:#567592;margin-bottom:3px;">Lowest</div>
-    <div style="font-family:'Sora',sans-serif;font-size:13px;font-weight:700;color:#e7c65a;">${min_price:,.0f}</div>
+    <div style="font-family:'Sora',sans-serif;font-size:13px;font-weight:700;color:#e7c65a;">{_format_currency(min_price)}</div>
   </div>
   <div style="background:#0b1c30;border:1px solid rgba(44,228,223,0.10);border-radius:14px;padding:16px 18px;">
-    <div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.14em;color:#567592;margin-bottom:6px;">Median Price</div>
-    <div style="font-family:'Sora',sans-serif;font-size:18px;font-weight:800;color:#ecf6ff;letter-spacing:-0.04em;">${price_med:,.0f}</div>
+    <div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.14em;color:#567592;margin-bottom:6px;">Median Visible Price</div>
+    <div style="font-family:'Sora',sans-serif;font-size:18px;font-weight:800;color:#ecf6ff;letter-spacing:-0.04em;">{_format_currency(price_med)}</div>
+    <div style="font-size:11px;color:#567592;margin-top:3px;">Sale price when available, otherwise ATTOM AVM.</div>
   </div>
 </div>
 """, unsafe_allow_html=True)
 
-if active_property is not None:
+if active_property is not None and active_property.get("MODEL_SOURCE") is not None:
     selected_address = html.escape(_to_text(active_property.get("ADDRESS")) or "Selected Property")
     st.markdown(f"""
 <div class='dash-section'>
@@ -2444,7 +2961,22 @@ if active_property is not None:
   </div>
 </div>
 """, unsafe_allow_html=True)
-    st.markdown(_render_feature_impact_section(active_property, map_source_df), unsafe_allow_html=True)
+    st.markdown(_render_feature_impact_section(active_property, map_market_df), unsafe_allow_html=True)
+
+if active_property is not None and active_prediction is not None and not active_prediction.get("error"):
+    forecast_factors = active_prediction.get("shap_factors") or []
+    if forecast_factors:
+        selected_address = html.escape(_to_text(active_property.get("ADDRESS")) or "Selected Property")
+        st.markdown(f"""
+<div class='dash-section'>
+  <div class='dash-section-bar'></div>
+  <div>
+    <div class='dash-section-label'>Forecast Explainability</div>
+    <div class='dash-section-title'>6-Month Forecast Drivers for {selected_address}</div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+        st.markdown(_render_forecast_explanation_section(active_property, active_prediction), unsafe_allow_html=True)
 
 st.markdown("""
 <div class='footer-note'>MOLLECUL · AI Real Estate Intelligence · DFW Metro</div>
