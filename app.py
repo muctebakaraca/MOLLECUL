@@ -176,6 +176,61 @@ AREA_FEATURES = {"sqft", "livingArea", "grossSqft", "groundFloorSqft", "lotSqft"
 COUNT_FEATURES = {"beds", "bathsFull", "bathsHalf", "bathsTotal", "totalRooms", "stories", "garageSpaces", "fireplaces"}
 YEAR_FEATURES = {"yearBuilt", "yearBuiltEffective", "taxYear", "saleYear"}
 
+FEATURE_GROUPS = [
+    {
+        "name": "Location",
+        "description": "Where the property sits and how the surrounding micro-market is identified.",
+        "features": [
+            "lat", "lng", "zip", "city", "county", "municipality", "subdivision",
+            "taxCodeArea", "geoIdV4_N2", "geoIdV4_N4", "geoIdV4_DB", "geoIdV4_SB",
+        ],
+    },
+    {
+        "name": "Size & Layout",
+        "description": "Living area, lot size, room count, and overall spatial footprint.",
+        "features": [
+            "sqft", "livingArea", "grossSqft", "groundFloorSqft", "lotSqft", "lotAcres",
+            "beds", "bathsFull", "bathsHalf", "bathsTotal", "totalRooms", "stories", "floors",
+        ],
+    },
+    {
+        "name": "Structure & Amenities",
+        "description": "Age, construction details, systems, garage, basement, and home features.",
+        "features": [
+            "yearBuilt", "yearBuiltEffective", "garageSize", "garageSpaces", "basement",
+            "basementSqft", "fireplaces", "pool", "bldgType", "condition", "view",
+            "garageType", "heatingType", "coolingType", "constructionType",
+            "foundationType", "roofMaterial", "roofType", "wallType", "frameType",
+        ],
+    },
+    {
+        "name": "Tax & Market Signals",
+        "description": "Assessments, tax load, calculated values, and market benchmarks.",
+        "features": [
+            "assessedTotal", "assessedLand", "assessedImprov", "assessedPerSqft",
+            "assessedImprPerSqft", "marketTotal", "marketLand", "marketImprov",
+            "taxAmount", "taxYear", "taxPerSqft", "calcTotalValue", "calcLandValue",
+            "calcImprValue", "calcValuePerSqft",
+        ],
+    },
+    {
+        "name": "Sale & Financing Context",
+        "description": "Recorded sale pricing, transaction type, disclosure, and financing context.",
+        "features": [
+            "salePrice", "pricePerSqft", "pricePerBed", "disclosed", "saleYear",
+            "saleType", "saleDocType", "cashOrMortgage", "newConstruction",
+            "interFamily", "sellerCarryback",
+        ],
+    },
+    {
+        "name": "Classification",
+        "description": "How the asset is categorized by use, subtype, and occupancy.",
+        "features": [
+            "propertyType", "propSubtype", "propClass", "propLandUse", "ownerOccupied",
+        ],
+    },
+]
+
 @st.cache_resource
 def load_valuation_model():
     """Load the XGBoost valuation pipeline from disk."""
@@ -295,7 +350,7 @@ def _calculate_feature_impacts(property_record: dict) -> dict:
 
         drivers.sort(key=lambda item: abs(item["impact"]), reverse=True)
         return {
-            "baseline": float(contribs[-1]),
+            "model_starting_point": float(contribs[-1]),
             "prediction": float(np.sum(contribs)),
             "drivers": drivers,
         }
@@ -303,92 +358,222 @@ def _calculate_feature_impacts(property_record: dict) -> dict:
         return {"error": f"Could not compute feature impacts: {e}"}
 
 
-def _render_feature_impact_rows(drivers: list[dict]) -> str:
-    if not drivers:
-        return (
-            "<div style='font-size:11px;color:#8baec8;'>"
-            "No populated model features were available for this property."
-            "</div>"
-        )
+def _group_feature_impacts(drivers: list[dict]) -> list[dict]:
+    groups = []
+    assigned_features = set()
 
-    max_impact = max(abs(driver["impact"]) for driver in drivers) or 1.0
+    for group in FEATURE_GROUPS:
+        group_drivers = [driver for driver in drivers if driver["feature"] in group["features"]]
+        if not group_drivers:
+            continue
+
+        group_drivers.sort(key=lambda item: abs(item["impact"]), reverse=True)
+        groups.append({
+            "name": group["name"],
+            "description": group["description"],
+            "impact": float(sum(driver["impact"] for driver in group_drivers)),
+            "drivers": group_drivers,
+        })
+        assigned_features.update(driver["feature"] for driver in group_drivers)
+
+    other_drivers = [driver for driver in drivers if driver["feature"] not in assigned_features]
+    if other_drivers:
+        other_drivers.sort(key=lambda item: abs(item["impact"]), reverse=True)
+        groups.append({
+            "name": "Other Signals",
+            "description": "Observed features that do not fit the main property groupings above.",
+            "impact": float(sum(driver["impact"] for driver in other_drivers)),
+            "drivers": other_drivers,
+        })
+
+    return groups
+
+
+def _normalize_location_key(value) -> str:
+    return _to_text(value).strip().lower()
+
+
+def _compute_micro_area_median(property_record: dict, market_df: pd.DataFrame) -> dict | None:
+    source_data = property_record.get("MODEL_SOURCE") or {}
+    if market_df.empty or "PRICE" not in market_df.columns:
+        return None
+
+    scoped_df = market_df
+    city_value = _normalize_location_key(_get_source_value(source_data, "city"))
+    if city_value and "CITY" in scoped_df.columns:
+        city_mask = scoped_df["CITY"].astype(str).str.strip().str.lower() == city_value
+        city_scoped_df = scoped_df.loc[city_mask]
+        if not city_scoped_df.empty:
+            scoped_df = city_scoped_df
+
+    match_candidates = [
+        ("geoIdV4_SB", "Sub-Boundary"),
+        ("geoIdV4_N4", "Sub-Neighborhood ID"),
+        ("subdivision", "Subdivision"),
+        ("geoIdV4_N2", "Neighborhood ID"),
+        ("geoIdV4_DB", "District Boundary"),
+        ("taxCodeArea", "Tax Code Area"),
+        ("zip", "ZIP Code"),
+        ("city", "City"),
+    ]
+
+    preferred_match = None
+    fallback_match = None
+
+    for feature_name, label in match_candidates:
+        target_value = _normalize_location_key(_get_source_value(source_data, feature_name))
+        if not target_value:
+            continue
+
+        candidate_columns = [feature_name] + MODEL_SOURCE_ALIASES.get(feature_name, [])
+        matched_df = None
+
+        for column in candidate_columns:
+            if column not in scoped_df.columns:
+                continue
+            series = scoped_df[column].astype(str).str.strip().str.lower()
+            column_match = scoped_df.loc[series == target_value]
+            if column_match["PRICE"].notna().any():
+                matched_df = column_match
+                break
+
+        if matched_df is None or matched_df.empty:
+            continue
+
+        comp_count = int(matched_df["PRICE"].notna().sum())
+        if comp_count == 0:
+            continue
+
+        result = {
+            "median_price": float(matched_df["PRICE"].median()),
+            "match_label": label,
+            "match_value": _to_text(_get_source_value(source_data, feature_name)),
+            "comp_count": comp_count,
+            "is_fallback": label == "City",
+        }
+
+        if comp_count >= 5:
+            preferred_match = result
+            break
+        if fallback_match is None:
+            fallback_match = result
+
+    return preferred_match or fallback_match
+
+
+def _render_grouped_feature_rows(drivers: list[dict]) -> str:
     rows = []
 
     for driver in drivers:
         impact = driver["impact"]
         positive = impact >= 0
         color = "#2ce4df" if positive else "#e7c65a"
-        width = max(12.0, (abs(impact) / max_impact) * 100)
         impact_label = f"{'+' if positive else '-'}${abs(impact):,.0f}"
 
         rows.append(f"""
-<div style="padding:10px 0;border-top:1px solid rgba(94,122,146,0.16);">
-  <div style="display:flex;align-items:flex-start;gap:10px;">
-    <div style="min-width:0;">
-      <div style="font-size:12px;font-weight:700;color:#ecf6ff;line-height:1.3;">{html.escape(driver['label'])}</div>
-      <div style="font-size:10px;color:#8baec8;margin-top:2px;line-height:1.4;">{driver['value']}</div>
-    </div>
-    <div style="margin-left:auto;font-family:'Sora',sans-serif;font-size:11px;font-weight:700;color:{color};white-space:nowrap;">{impact_label}</div>
+<div class="feature-driver-row">
+  <div style="min-width:0;">
+    <div class="feature-driver-label">{html.escape(driver['label'])}</div>
+    <div class="feature-driver-value">{driver['value']}</div>
   </div>
-  <div style="margin-top:8px;height:7px;background:rgba(94,122,146,0.16);border-radius:999px;overflow:hidden;">
-    <div style="height:100%;width:{width:.1f}%;background:{color};box-shadow:0 0 12px {color}55;border-radius:999px;"></div>
-  </div>
+  <div class="feature-driver-impact" style="color:{color};">{impact_label}</div>
 </div>
 """)
 
     return "".join(rows)
 
 
-def _render_feature_impact_card(property_record: dict) -> str:
+def _render_feature_impact_section(property_record: dict, market_df: pd.DataFrame) -> str:
     explanation = _calculate_feature_impacts(property_record)
     if explanation.get("error"):
         return f"""
-<div style="background:#0b1c30;border:1px solid rgba(231,198,90,0.18);border-radius:14px;padding:16px 18px;">
+<div style="background:#0b1c30;border:1px solid rgba(231,198,90,0.18);border-radius:18px;padding:18px 20px;">
   <div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.14em;color:#e7c65a;margin-bottom:6px;">Feature Impact</div>
   <div style="font-size:11px;color:#8baec8;line-height:1.6;">{html.escape(explanation['error'])}</div>
 </div>
 """
 
     drivers = explanation["drivers"]
-    preview_drivers = drivers[:6]
-    remaining_drivers = drivers[6:]
-    baseline_value = _format_currency(explanation.get("baseline"))
-    prediction_value = _format_currency(explanation.get("prediction"))
-    preview_rows = _render_feature_impact_rows(preview_drivers)
-    detail_rows = _render_feature_impact_rows(remaining_drivers)
-    detail_html = ""
-
-    if remaining_drivers:
-        detail_html = f"""
-<details style="margin-top:12px;">
-  <summary style="cursor:pointer;font-size:11px;font-weight:700;color:#8baec8;list-style:none;">
-    View {len(remaining_drivers)} more observed feature effects
-  </summary>
-  <div style="margin-top:10px;">
-    {detail_rows}
+    if not drivers:
+        return """
+<div style="background:#0b1c30;border:1px solid rgba(94,166,255,0.18);border-radius:18px;padding:18px 20px;">
+  <div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.14em;color:#567592;margin-bottom:6px;">Feature Impact</div>
+  <div style="font-size:11px;color:#8baec8;line-height:1.6;">
+    The model estimate is available, but there were not enough populated features on this property to build a grouped impact breakdown.
   </div>
-</details>
+</div>
 """
+    grouped_impacts = _group_feature_impacts(drivers)
+    model_starting_point_value = _format_currency(explanation.get("model_starting_point"))
+    prediction_value = _format_currency(explanation.get("prediction"))
+    micro_area = _compute_micro_area_median(property_record, market_df)
+    micro_area_value = _format_currency(micro_area["median_price"]) if micro_area else "N/A"
+    micro_area_meta = "No comparable local sale prices found in the loaded market data."
+    if micro_area:
+        delta = explanation.get("prediction", 0) - micro_area["median_price"]
+        delta_text = f"{'+' if delta >= 0 else '-'}${abs(delta):,.0f} vs local median"
+        scope_prefix = "Fallback to city" if micro_area["is_fallback"] else f"Matched on {micro_area['match_label']}"
+        micro_area_meta = f"{scope_prefix} · {micro_area['comp_count']} comps · {delta_text}"
+
+    group_cards = []
+
+    for group in grouped_impacts:
+        group_positive = group["impact"] >= 0
+        group_color = "#2ce4df" if group_positive else "#e7c65a"
+        group_total = f"{'+' if group_positive else '-'}${abs(group['impact']):,.0f}"
+        group_cards.append(f"""
+<div class="feature-group-card">
+  <div class="feature-group-head">
+    <div>
+      <div class="feature-group-name">{html.escape(group['name'])}</div>
+      <div class="feature-group-desc">{html.escape(group['description'])}</div>
+    </div>
+    <div class="feature-group-total" style="color:{group_color};">{group_total}</div>
+  </div>
+  <div class="feature-group-body">
+    {_render_grouped_feature_rows(group['drivers'])}
+  </div>
+</div>
+""")
+
+    group_cards_html = "".join(group_cards)
 
     return f"""
-<div style="background:#0b1c30;border:1px solid rgba(94,166,255,0.22);border-radius:14px;padding:16px 18px;">
-  <div style="display:flex;align-items:flex-start;gap:12px;margin-bottom:8px;">
+<div class="feature-impact-panel">
+  <div class="feature-impact-summary">
     <div>
-      <div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.14em;color:#567592;">Feature Impact</div>
-      <div style="font-size:11px;color:#8baec8;margin-top:4px;line-height:1.5;">
-        How the model is moving this property away from its baseline value.
+      <div class="feature-impact-kicker">Feature Impact</div>
+      <div class="feature-impact-title">Grouped Value Breakdown</div>
+      <div class="feature-impact-copy">
+        Related features are grouped together so it is easier to see what is driving the estimate, where the model starts, and how that estimate compares with nearby pricing.
       </div>
     </div>
-    <div style="margin-left:auto;text-align:right;">
-      <div style="font-size:10px;color:#567592;text-transform:uppercase;letter-spacing:0.10em;">Baseline</div>
-      <div style="font-family:'Sora',sans-serif;font-size:13px;font-weight:700;color:#ecf6ff;">{baseline_value}</div>
+    <div class="feature-impact-metrics">
+      <div class="feature-impact-metric">
+        <div class="feature-impact-metric-label">Model Starting Point</div>
+        <div class="feature-impact-metric-value">{model_starting_point_value}</div>
+        <div class="feature-impact-metric-sub">Global model starting value before this property's features adjust it.</div>
+      </div>
+      <div class="feature-impact-metric">
+        <div class="feature-impact-metric-label">Micro-Area Median Price</div>
+        <div class="feature-impact-metric-value">{micro_area_value}</div>
+        <div class="feature-impact-metric-sub">{html.escape(micro_area_meta)}</div>
+      </div>
+      <div class="feature-impact-metric">
+        <div class="feature-impact-metric-label">Model Estimate</div>
+        <div class="feature-impact-metric-value feature-impact-metric-value-blue">{prediction_value}</div>
+        <div class="feature-impact-metric-sub">Grouped drivers below sum from the model starting point to this estimate.</div>
+      </div>
+      <div class="feature-impact-metric">
+        <div class="feature-impact-metric-label">Observed Drivers</div>
+        <div class="feature-impact-metric-value">{len(drivers)}</div>
+        <div class="feature-impact-metric-sub">Only populated property features are shown in the grouped breakdown.</div>
+      </div>
     </div>
   </div>
-  <div style="font-size:10px;color:#567592;margin-bottom:8px;text-transform:uppercase;letter-spacing:0.10em;">Model Estimate</div>
-  <div style="font-family:'Sora',sans-serif;font-size:18px;font-weight:800;color:#5ea6ff;letter-spacing:-0.04em;margin-bottom:10px;">{prediction_value}</div>
-  <div style="font-size:10px;color:#567592;margin-bottom:2px;text-transform:uppercase;letter-spacing:0.10em;">Strongest Observed Drivers</div>
-  {preview_rows}
-  {detail_html}
+  <div class="feature-impact-grid">
+    {group_cards_html}
+  </div>
 </div>
 """
 
@@ -778,7 +963,7 @@ def _render_value_comparison_chart(property_record: dict) -> str:
             value_label = "N/A"
 
         if label == "Sale Price":
-            delta_html = "<span style='color:#567592;'>Baseline</span>"
+            delta_html = "<span style='color:#567592;'>Sale Reference</span>"
         elif pd.notna(value) and pd.notna(sale_price) and sale_price > 0:
             diff = value - sale_price
             pct = (diff / sale_price) * 100
@@ -838,7 +1023,6 @@ def _render_property_panel(property_record: dict, prediction: dict | None = None
     price_label = html.escape(_to_text(property_record.get("PRICE_LABEL")) or "Price Reference")
     price_value = _format_currency(property_record.get("PRICE"))
     comparison_html = _render_value_comparison_chart(property_record)
-    feature_impact_html = _render_feature_impact_card(property_record)
 
     forecast_html = ""
     if prediction is not None:
@@ -903,7 +1087,6 @@ def _render_property_panel(property_record: dict, prediction: dict | None = None
   </div>
   {forecast_html}
   {comparison_html}
-  {feature_impact_html}
   <div style="background:#0b1c30;border:1px solid rgba(44,228,223,0.10);border-radius:14px;padding:16px 18px;">
     <div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.14em;color:#567592;margin-bottom:4px;">{price_label}</div>
     <div style="font-family:'Sora',sans-serif;font-size:18px;font-weight:800;color:#ecf6ff;letter-spacing:-0.04em;">{price_value}</div>
@@ -1171,6 +1354,164 @@ header[data-testid="stHeader"] {
 .chart-panel-sub {
   font-size: 11px; color: var(--muted-2);
   margin-left: auto; letter-spacing: 0.04em;
+}
+
+/* ── Feature impact section ── */
+.feature-impact-panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  box-shadow: var(--shadow);
+  padding: 22px;
+}
+.feature-impact-summary {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 20px;
+}
+.feature-impact-kicker {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  font-weight: 700;
+  color: var(--muted-2);
+  margin-bottom: 6px;
+}
+.feature-impact-title {
+  font-family: 'Sora', sans-serif;
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: -0.04em;
+  color: var(--text);
+}
+.feature-impact-copy {
+  max-width: 560px;
+  margin-top: 8px;
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--muted);
+}
+.feature-impact-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  min-width: 720px;
+}
+.feature-impact-metric {
+  background: rgba(8, 18, 33, 0.8);
+  border: 1px solid rgba(94,166,255,0.10);
+  border-radius: 16px;
+  padding: 14px 16px;
+}
+.feature-impact-metric-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-weight: 700;
+  color: var(--muted-2);
+  margin-bottom: 6px;
+}
+.feature-impact-metric-value {
+  font-family: 'Sora', sans-serif;
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -0.04em;
+  color: var(--text);
+}
+.feature-impact-metric-sub {
+  margin-top: 8px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+.feature-impact-metric-value-blue { color: var(--blue); }
+.feature-impact-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+}
+.feature-group-card {
+  background: rgba(8, 18, 33, 0.86);
+  border: 1px solid rgba(94,166,255,0.09);
+  border-radius: 18px;
+  padding: 18px;
+}
+.feature-group-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.feature-group-name {
+  font-family: 'Sora', sans-serif;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: -0.02em;
+}
+.feature-group-desc {
+  margin-top: 6px;
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--muted);
+}
+.feature-group-total {
+  font-family: 'Sora', sans-serif;
+  font-size: 16px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.feature-group-body {
+  display: flex;
+  flex-direction: column;
+}
+.feature-driver-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 0;
+  border-top: 1px solid rgba(94,122,146,0.16);
+}
+.feature-driver-label {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text);
+  line-height: 1.35;
+}
+.feature-driver-value {
+  font-size: 10px;
+  color: var(--muted);
+  margin-top: 2px;
+  line-height: 1.45;
+}
+.feature-driver-impact {
+  font-family: 'Sora', sans-serif;
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+@media (max-width: 1180px) {
+  .feature-impact-summary {
+    flex-direction: column;
+  }
+  .feature-impact-metrics {
+    min-width: 0;
+    width: 100%;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .feature-impact-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 780px) {
+  .feature-impact-metrics,
+  .feature-impact-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 /* ── Map & table panels ── */
@@ -1769,8 +2110,20 @@ import re as _re
 def _normalize_addr(s):
     return _re.sub(r"\s+", " ", str(s).lower().strip())
 
-# Read from session state (widget value stored from previous render)
-address_query = st.session_state.get("map_address_search", "")
+
+def _submit_address_search():
+    st.session_state["map_address_search"] = st.session_state.get("map_address_input", "").strip()
+
+
+def _clear_address_search():
+    st.session_state["map_address_input"] = ""
+    st.session_state["map_address_search"] = ""
+
+if "map_address_input" not in st.session_state:
+    st.session_state["map_address_input"] = st.session_state.get("map_address_search", "")
+
+# Read only the committed search value, not the live keystrokes.
+address_query = st.session_state.get("map_address_search", "").strip()
 
 searched_property = None
 search_feedback   = None
@@ -1815,13 +2168,30 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Address search bar (visible here above map; resolved earlier for charts) ────
-search_col, _ = st.columns([2, 3])
+search_col, search_btn_col, clear_btn_col, _ = st.columns([6, 1, 1, 2])
 with search_col:
     st.text_input(
         label="",
         placeholder="🔍  Search an address to zoom in…",
-        key="map_address_search",
+        key="map_address_input",
+        on_change=_submit_address_search,
         label_visibility="collapsed",
+    )
+with search_btn_col:
+    st.markdown("<div style='height: 1px;'></div>", unsafe_allow_html=True)
+    st.button(
+        "Search",
+        key="map_address_search_button",
+        use_container_width=True,
+        on_click=_submit_address_search,
+    )
+with clear_btn_col:
+    st.markdown("<div style='height: 1px;'></div>", unsafe_allow_html=True)
+    st.button(
+        "Clear",
+        key="map_address_clear_button",
+        use_container_width=True,
+        on_click=_clear_address_search,
     )
 
 # Feedback
@@ -2062,6 +2432,19 @@ with stat_col:
   </div>
 </div>
 """, unsafe_allow_html=True)
+
+if active_property is not None:
+    selected_address = html.escape(_to_text(active_property.get("ADDRESS")) or "Selected Property")
+    st.markdown(f"""
+<div class='dash-section'>
+  <div class='dash-section-bar'></div>
+  <div>
+    <div class='dash-section-label'>Model Explainability</div>
+    <div class='dash-section-title'>Feature Impact for {selected_address}</div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+    st.markdown(_render_feature_impact_section(active_property, map_source_df), unsafe_allow_html=True)
 
 st.markdown("""
 <div class='footer-note'>MOLLECUL · AI Real Estate Intelligence · DFW Metro</div>
