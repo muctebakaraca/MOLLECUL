@@ -1,4 +1,5 @@
 import os
+import base64
 import html
 import numpy as np
 import pandas as pd
@@ -29,6 +30,18 @@ def _resolve_existing_path(*relative_candidates: str) -> str:
         if os.path.exists(abs_path):
             return abs_path
     return os.path.join(BASE_DIR, relative_candidates[0])
+
+
+def _build_inline_image_data_uri(*relative_candidates: str) -> str:
+    """Return a base64 data URI for a project image."""
+    image_path = _resolve_existing_path(*relative_candidates)
+    if not os.path.exists(image_path):
+        return ""
+
+    mime_type = "image/png" if image_path.lower().endswith(".png") else "image/jpeg"
+    with open(image_path, "rb") as image_file:
+        encoded = base64.b64encode(image_file.read()).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
 
 
 csv_path = _resolve_existing_path(
@@ -2158,6 +2171,8 @@ h1,h2,h3,h4,h5,h6 {
 # =============================================================================
 # HERO
 # =============================================================================
+HERO_LOGO_SRC = _build_inline_image_data_uri("Mollecul Logo (1).png", "mollecul logo (1).png")
+
 HERO_HTML = """
 <!DOCTYPE html>
 <html>
@@ -2250,11 +2265,10 @@ HERO_HTML = """
     margin-bottom: 22px;
     animation: fadeUp 0.7s 0.08s ease both;
   }
-  .brand-name {
-    font-family: 'Sora', sans-serif;
-    font-size: 26px; font-weight: 700;
-    letter-spacing: -0.06em;
-    color: #edf7ff;
+  .brand-logo {
+    width: min(220px, 48vw);
+    height: auto;
+    display: block;
   }
 
   /* Hero headline */
@@ -2343,17 +2357,7 @@ HERO_HTML = """
       <div class="eyebrow"><span class="eyebrow-dot"></span>AI Real Estate Intelligence</div>
 
       <div class="brand">
-        <svg width="38" height="38" viewBox="0 0 44 44" fill="none" xmlns="http://www.w3.org/2000/svg">
-          <circle cx="22" cy="22" r="17" stroke="#2CE4DF" stroke-width="1.3" stroke-dasharray="3 3.5" opacity="0.5"/>
-          <circle cx="36" cy="22" r="2.7" fill="#2CE4DF" opacity="0.9"/>
-          <rect x="17" y="11" width="6" height="18" rx="1.4" fill="#E7C65A"/>
-          <rect x="11" y="16" width="4.8" height="13" rx="1.4" fill="#2CE4DF" opacity="0.85"/>
-          <rect x="25" y="14" width="4.8" height="15" rx="1.4" fill="#5EA6FF" opacity="0.8"/>
-          <line x1="8" y1="29" x2="31" y2="29" stroke="#2CE4DF" stroke-width="1.0" opacity="0.3"/>
-          <circle cx="22" cy="6.5" r="1.8" fill="#5EA6FF" opacity="0.7"/>
-          <circle cx="6.5" cy="22" r="2.0" fill="#E7C65A" opacity="0.8"/>
-        </svg>
-        <div class="brand-name">mollecul</div>
+        <img class="brand-logo" src="__MOLLECUL_LOGO_SRC__" alt="Mollecul logo" />
       </div>
 
       <div class="title">
@@ -2678,6 +2682,7 @@ render();
 </body>
 </html>
 """
+HERO_HTML = HERO_HTML.replace("__MOLLECUL_LOGO_SRC__", HERO_LOGO_SRC)
 
 components.html(HERO_HTML, height=610, scrolling=False)
 
